@@ -452,7 +452,7 @@ who(client) -> "C".
 %% Init the session key
 
 init_session(User,Options) ->
-    {Uid,Adr} = user_address(User),
+    {Uid,Adr} = user_address(User, Options),
     S = init_options(Uid,Adr,Options),
     InitialSSL = case S#sk.encryption of
                      tcp -> false;
@@ -464,11 +464,23 @@ init_session(User,Options) ->
 init_options(Uid,Adr,Options) ->
     set_options(Options,#sk{user=Uid,addr=Adr}).
 
-user_address(User) ->
+user_address(User, Options) ->
     case string:tokens(User,"@") of
-	List when length(List)>1 -> make_uid_address(List);
-	_ -> throw({error,address_format})
+        List when length(List)>1 -> 
+	    Addr = make_uid_address(List),
+	    case is_fulluser(Options) of
+                true ->  erlang:setelement(1, Addr, User);
+                _    ->  addr
+            end;
+	 _ -> throw({error,address_format})
     end.
+
+is_fulluser([fulluser|_]) ->
+    true;
+is_fulluser([_|T]) ->
+    is_fulluser(T);
+is_fulluser([]) ->
+    false.
 
 make_uid_address(L) -> make_uid_address(L, "").
 
@@ -484,6 +496,8 @@ set_options([apop|T],S) ->
     set_options(T,S#sk{apop=true});
 set_options([upass|T],S) ->
     set_options(T,S#sk{apop=false});
+set_options([fulluser|T], S) ->
+    set_options(T,S#sk{fulluser=true});
 set_options([ssl|T],S) ->
     % TODO: Ought to warn about tls/ssl conflict
     set_options(T,S#sk{encryption=ssl});
@@ -508,4 +522,3 @@ strip(_)                      -> [].
 
 l2i(List) when is_list(List)  -> list_to_integer(List);
 l2i(Int) when is_integer(Int) -> Int.
-

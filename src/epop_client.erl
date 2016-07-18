@@ -4,7 +4,7 @@
 %%%---------------------------------------------------------------------
 %%% File    : epop_client.erl
 %%% Created : 10 Sep 2008 by harish.mallipeddi@gmail.com
-%%% Function: POP3 client (with SSL support)
+%%% Function: POP3 client (with SSL and TLS support)
 %%% ====================================================================
 %%% The contents of this file are subject to the Erlang Public License
 %%% License, Version 1.1, (the "License"); you may not use this file
@@ -25,7 +25,7 @@
 %%% Contributor(s):
 %%%     11 Mar 1998 by tobbe@serc.rmit.edu.au
 %%%     10 Sep 2008 by harish.mallipeddi@gmail.com (added support for SSL).
-%%%
+%%%     05 Mar 2014 by eriksoe@gmail.com (added support for TLS).
 %%%---------------------------------------------------------------------
 
 -vc('$Id$ ').
@@ -61,7 +61,7 @@ parse_notification(S,Passwd) ->
     case recv_sl(S) of
 	{[$N,$T,$F,$Y|T],_} ->
 	    User = parse_user(T),
-	    answer_greeting(S#sk{user=User},Passwd,T);
+	    send_login(S#sk{user=User},Passwd,T);
 	_ ->
 	    error_msg("epop_client: Wrong connect message !~n"),
 	    exit(wrong_connect)
@@ -92,11 +92,31 @@ connect(User,Passwd,Options) when is_list(User), is_list(Passwd), is_list(Option
 do_connect(User,Passwd,Options) when is_list(User), is_list(Passwd), is_list(Options) ->
     S = init_session(User,Options),
     case do_connect_proto(S) of
-        {ok,Sock} -> get_greeting(S#sk{sockfd=Sock},Passwd);
-        _         -> {error,connect_failed}
+        {ok,Sock} ->
+            S2 = S#sk{sockfd=Sock},
+            %% Ensure to close the socket in all error cases:
+            try get_greeting(S2,Passwd) of
+                {ok, _}=Result ->
+                    Result;
+                {error,_}=Result ->
+                    do_close(S2),
+                    Result
+            catch Cls:Error ->
+                    do_close(S2),
+                    erlang:raise(Cls, Error, erlang:get_stacktrace())
+            end;
+        _ ->
+            {error,connect_failed}
     end.
 
 do_connect_proto(S) ->
+    case S#sk.encryption of
+        Enc when Enc==ssl; Enc==tls ->
+            ssl:start();
+        _ ->
+            ok
+    end,
+
     case S#sk.ssl of
         false ->
             %% default POP3
@@ -104,8 +124,6 @@ do_connect_proto(S) ->
             gen_tcp:connect(S#sk.addr, S#sk.port, Opts);
         true ->
             %% handle POP3 over SSL
-%            application:start(ssl),
-			ssl:start(),
             Opts = [{packet,raw}, {reuseaddr,true}, {active,false}],
             ssl:connect(S#sk.addr, S#sk.port, Opts)
     end.
@@ -123,13 +141,38 @@ get_greeting(S,Passwd) ->
     	    {error,T}
     end.
 
-answer_greeting(S,Passwd,T) when S#sk.apop==false ->
+answer_greeting(S, Passwd, T) ->
+    case S#sk.encryption of
+        tls ->
+            case start_tls(S) of
+                {ok,S2} ->
+                    send_login(S2,Passwd,T);
+                {error,_}=Error ->
+                    Error
+            end;
+        _ ->
+            send_login(S,Passwd,T)
+    end.
+
+start_tls(S) ->
+    deliver(S, "STLS"),
+    if_snoop(S,client,"STLS"),
+    get_ok(S),
+    if_snoop(S,sender,"+OK"),
+    case ssl:connect(S#sk.sockfd, [{packet,raw}, {active,false}]) of
+        {ok,SSLSock} ->
+            {ok, S#sk{ssl=true, sockfd=SSLSock}};
+        {error,_}=Error ->
+            Error
+    end.
+
+send_login(S,Passwd,T) when S#sk.apop==false ->
     if_snoop(S,sender,"+OK" ++ T),
     Msg = "USER " ++ S#sk.user,
     deliver(S,Msg),
     if_snoop(S,client,Msg),
     send_passwd(S,Passwd);
-answer_greeting(S,Passwd,T) when S#sk.apop==true ->
+send_login(S,Passwd,T) when S#sk.apop==true ->
     if_snoop(S,sender,"+OK" ++ T),
     TS = parse_banner_timestamp(T),
     Digest = epop_md5:string(TS ++ Passwd),
@@ -347,11 +390,14 @@ quit(S) ->
 	      {ok,_} -> ok;
 	      Else   -> Else
 	  end,
+    do_close(S),
+    Res.
+
+do_close(S) ->
     case S#sk.ssl of
         true -> ssl:close(S#sk.sockfd);
         false -> gen_tcp:close(S#sk.sockfd)
-    end,
-    Res.
+    end.
 
 %% ----------------------------------------------------
 %% Order notification.
@@ -406,17 +452,35 @@ who(client) -> "C".
 %% Init the session key
 
 init_session(User,Options) ->
-    {Uid,Adr} = user_address(User),
-    init_options(Uid,Adr,Options).
+    {Uid,Adr} = user_address(User, Options),
+    S = init_options(Uid,Adr,Options),
+    InitialSSL = case S#sk.encryption of
+                     tcp -> false;
+                     tls -> false;
+                     ssl -> true
+                 end,
+    S#sk{ssl=InitialSSL}.
 
 init_options(Uid,Adr,Options) ->
     set_options(Options,#sk{user=Uid,addr=Adr}).
 
-user_address(User) ->
+user_address(User, Options) ->
     case string:tokens(User,"@") of
-	List when length(List)>1 -> make_uid_address(List);
-	_ -> throw({error,address_format})
+        List when length(List)>1 -> 
+	    Addr = make_uid_address(List),
+	    case is_fulluser(Options) of
+                true ->  erlang:setelement(1, Addr, User);
+                _    ->  addr
+            end;
+	 _ -> throw({error,address_format})
     end.
+
+is_fulluser([fulluser|_]) ->
+    true;
+is_fulluser([_|T]) ->
+    is_fulluser(T);
+is_fulluser([]) ->
+    false.
 
 make_uid_address(L) -> make_uid_address(L, "").
 
@@ -432,8 +496,14 @@ set_options([apop|T],S) ->
     set_options(T,S#sk{apop=true});
 set_options([upass|T],S) ->
     set_options(T,S#sk{apop=false});
+set_options([fulluser|T], S) ->
+    set_options(T,S#sk{fulluser=true});
 set_options([ssl|T],S) ->
-    set_options(T,S#sk{ssl=true});
+    % TODO: Ought to warn about tls/ssl conflict
+    set_options(T,S#sk{encryption=ssl});
+set_options([tls|T],S) ->
+    % TODO: Ought to warn about tls/ssl conflict
+    set_options(T,S#sk{encryption=tls});
 set_options([{addr,Addr}|T], S) ->
     set_options(T,S#sk{addr=Addr});
 set_options([{user,User}|T], S) ->
@@ -452,4 +522,3 @@ strip(_)                      -> [].
 
 l2i(List) when is_list(List)  -> list_to_integer(List);
 l2i(Int) when is_integer(Int) -> Int.
-
